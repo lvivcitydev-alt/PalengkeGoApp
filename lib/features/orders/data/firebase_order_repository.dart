@@ -1,6 +1,9 @@
+import 'dart:convert';
+
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:cloud_functions/cloud_functions.dart';
+import 'package:http/http.dart' as http;
+import 'package:palengkego/core/config/app_config.dart';
 import 'package:palengkego/features/orders/domain/fulfillment_method.dart';
 import 'package:palengkego/features/orders/domain/market_order.dart';
 import 'package:palengkego/features/orders/domain/order_failure.dart';
@@ -11,13 +14,13 @@ import 'package:palengkego/features/orders/domain/order_status_history.dart';
 import 'package:palengkego/features/orders/domain/payment_status.dart';
 
 /// Firestore-backed [OrderRepository] that routes every MUTATION through the
-/// trusted Firebase Cloud Functions callables (functions/src):
+/// trusted Supabase Edge Functions (supabase/functions — kebab-case):
 ///
-///   placeOrders       → `placeOrder`        (server-side pricing + stock)
-///   updateOrderStatus → `updateOrderStatus` (state machine + audit log)
-///   cancelOrder       → `cancelOrder`       (window check + audit log)
-///   requestRefund     → `requestRefund`     (paid → refundRequested)
-///   processRefundRequest → `processRefund`  (approve/decline + money path)
+///   placeOrders       → `place-order`        (server-side pricing + stock)
+///   updateOrderStatus → `update-order-status` (state machine + audit log)
+///   cancelOrder       → `cancel-order`       (window check + audit log)
+///   requestRefund     → `request-refund`     (paid → refundRequested)
+///   processRefundRequest → `process-refund`  (approve/decline + money path)
 ///
 /// The client never writes prices, stock, or statusHistory directly — it only
 /// READS orders/history from Firestore. The callables stamp the real acting
@@ -26,6 +29,9 @@ import 'package:palengkego/features/orders/domain/payment_status.dart';
 /// AUTH NOTE (audit 2026-09-13 H1): auth + App Check tokens attach
 /// automatically via the cloud_functions SDK. The callables are deployed in
 /// `asia-southeast1`, mirroring setGlobalOptions in functions/src/index.ts.
+@Deprecated(
+  'Use SupabaseOrderRepository — Firebase callables are kept deployed for rollback only',
+)
 class FirebaseOrderRepository implements OrderRepository {
   FirebaseOrderRepository(this._firestore, this._auth);
 
@@ -147,7 +153,7 @@ class FirebaseOrderRepository implements OrderRepository {
       final stallId = vendorStallIds[entry.key]!;
       final lineItems = entry.value.$2;
 
-      final result = await _callTrusted('placeOrder', {
+      final result = await _callTrusted('place-order', {
         'stallId': stallId,
         'items': lineItems
             .map(
@@ -208,7 +214,7 @@ class FirebaseOrderRepository implements OrderRepository {
     String? remarks,
     DateTime? estimatedReadyTime,
   }) async {
-    await _callTrusted('updateOrderStatus', {
+    await _callTrusted('update-order-status', {
       'orderId': orderId,
       'newStatus': newStatus.name,
       'remarks': ?remarks,
@@ -224,7 +230,7 @@ class FirebaseOrderRepository implements OrderRepository {
     String? reason,
     DateTime? now,
   }) async {
-    await _callTrusted('cancelOrder', {
+    await _callTrusted('cancel-order', {
       'orderId': orderId,
       'reason': ?reason,
     });
@@ -232,7 +238,7 @@ class FirebaseOrderRepository implements OrderRepository {
 
   @override
   Future<void> requestRefund(String orderId, {String? reason}) async {
-    await _callTrusted('requestRefund', {
+    await _callTrusted('request-refund', {
       'orderId': orderId,
       'reason': ?reason,
     });
@@ -244,7 +250,7 @@ class FirebaseOrderRepository implements OrderRepository {
     required bool approve,
     String? reason,
   }) async {
-    await _callTrusted('processRefund', {
+    await _callTrusted('process-refund', {
       'orderId': orderId,
       'decision': approve ? 'approve' : 'decline',
       'reason': ?reason,
@@ -285,9 +291,9 @@ class FirebaseOrderRepository implements OrderRepository {
 
   // ── Trusted-call plumbing ───────────────────────────────────────────────────
 
-  /// Calls a trusted Firebase callable (deployed in asia-southeast1). Auth
-  /// and App Check tokens are attached automatically by the cloud_functions
-  /// SDK.
+  /// Calls a trusted Supabase Edge Function via HTTP POST.
+  /// Auth token is attached via Authorization: Bearer header.
+  /// Uses Firebase ID token from FirebaseAuth for authentication.
   Future<Map<String, dynamic>> _callTrusted(
     String functionName,
     Map<String, dynamic> payload,
@@ -300,47 +306,80 @@ class FirebaseOrderRepository implements OrderRepository {
       );
     }
     try {
-      final callable = FirebaseFunctions.instanceFor(region: 'asia-southeast1')
-          .httpsCallable(
-        functionName,
-        options: HttpsCallableOptions(timeout: const Duration(seconds: 60)),
+      // Get Firebase ID token for Bearer auth
+      final idToken = await user.getIdToken();
+      
+      // Build the edge function URL
+      // Assumes SUPABASE_URL is available via AppConfig
+      final supabaseUrl = _getSupabaseUrl();
+      final url = Uri.parse('$supabaseUrl/functions/v1/$functionName');
+      
+      final response = await http.post(
+        url,
+        headers: {
+          'Authorization': 'Bearer $idToken',
+          'Content-Type': 'application/json',
+        },
+        body: jsonEncode(payload),
+      ).timeout(const Duration(seconds: 60));
+
+      if (response.statusCode == 200) {
+        return jsonDecode(response.body) as Map<String, dynamic>;
+      } else if (response.statusCode == 401 || response.statusCode == 403) {
+        throw const OrderFailure(
+          OrderFailureType.unauthenticated,
+          message: 'You must be signed in to do that.',
+        );
+      } else {
+        // Parse error response from edge function
+        final errorBody = jsonDecode(response.body) as Map<String, dynamic>?;
+        final error = errorBody?['error'] as Map<String, dynamic>?;
+        final code = error?['code'] as String? ?? 'internal';
+        final message = error?['message'] as String?;
+        throw _mapEdgeFunctionError(code, message);
+      }
+    } catch (e) {
+      if (e is OrderFailure) rethrow;
+      // Network errors, timeout, etc.
+      throw const OrderFailure(
+        OrderFailureType.networkError,
+        message: 'Could not connect to server. Please try again.',
       );
-      final result = await callable.call<Map<String, dynamic>>(payload);
-      return result.data;
-    } on FirebaseFunctionsException catch (e) {
-      throw _mapFunctionException(e);
     }
   }
 
-  /// Maps a FirebaseFunctionsException (HttpsError code + message thrown by
-  /// the functions/src callables) onto the typed [OrderFailure] contract the
-  /// UI already understands. The HttpsError codes are identical to the codes
-  /// the old edge-function port returned, so the mapping is 1:1.
-  OrderFailure _mapFunctionException(FirebaseFunctionsException e) {
-    final code = e.code;
-    final message = e.message;
+  String _getSupabaseUrl() {
+    final url = AppConfig.load().supabaseUrl;
+    return url.isNotEmpty ? url : 'https://palengkego.supabase.co';
+  }
 
+  /// Maps edge function errors to OrderFailure types.
+  OrderFailure _mapEdgeFunctionError(String code, String? message) {
     switch (code) {
       case 'unauthenticated':
-        return OrderFailure(
+        return const OrderFailure(
           OrderFailureType.unauthenticated,
-          message: message ?? 'You must be signed in to do that.',
+          message: 'You must be signed in to do that.',
         );
       case 'permission-denied':
         return OrderFailure(
-          OrderFailureType.unauthenticated,
-          message: message ?? 'You do not have permission to do that.',
+          OrderFailureType.illegalStatusTransition,
+          message: message ?? 'You do not have permission for this action.',
         );
       case 'not-found':
-        return OrderFailure(
+        return const OrderFailure(
           OrderFailureType.orderNotFound,
-          message:
-              message ?? 'A product in your order is no longer available.',
+          message: 'Order not found.',
+        );
+      case 'invalid-argument':
+        return OrderFailure(
+          OrderFailureType.invalidQuantity,
+          message: message ?? 'Invalid request data.',
         );
       case 'out-of-range':
-        return OrderFailure(
-          OrderFailureType.outOfStock,
-          message: message ?? 'Not enough stock for one of your items.',
+        return const OrderFailure(
+          OrderFailureType.invalidQuantity,
+          message: 'Not enough stock for one of your items.',
         );
       case 'failed-precondition':
         return OrderFailure(
@@ -348,25 +387,24 @@ class FirebaseOrderRepository implements OrderRepository {
           message: message ?? 'This action is not allowed right now.',
         );
       case 'already-exists':
-        return OrderFailure(
+        return const OrderFailure(
           OrderFailureType.alreadyTerminal,
-          message: message ?? 'This has already been done.',
+          message: 'This has already been done.',
         );
       case 'deadline-exceeded':
-        return OrderFailure(
+        return const OrderFailure(
           OrderFailureType.cancelWindowExpired,
-          message: message ?? 'The cancellation window has expired.',
+          message: 'The cancellation window has expired.',
         );
       case 'resource-exhausted':
-        return OrderFailure(
+        return const OrderFailure(
           OrderFailureType.rateLimited,
-          message:
-              message ?? 'Too many requests — please try again shortly.',
+          message: 'Too many requests — please try again shortly.',
         );
       default:
         return OrderFailure(
-          OrderFailureType.orderNotFound,
-          message: message ?? 'Something went wrong. Please try again.',
+          OrderFailureType.networkError,
+                message: message ?? 'Something went wrong. Please try again.',
         );
     }
   }
